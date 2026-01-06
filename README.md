@@ -15,20 +15,11 @@ Store coding context, decisions, and tasks directly in your git repository. Work
 
 ## Installation
 
-### From Source (Go)
-
 ```bash
 cd go
-CGO_ENABLED=0 go build -o git-ctx ./cmd/git-ctx
-cp git-ctx ~/.local/bin/
-git config --global alias.ctx '!git-ctx'
-```
-
-### From Source (Bash)
-
-```bash
-./install.sh
+make install
 # Or manually:
+CGO_ENABLED=0 go build -o git-ctx ./cmd/git-ctx
 cp git-ctx ~/.local/bin/
 git config --global alias.ctx '!git-ctx'
 ```
@@ -191,12 +182,9 @@ After each phase, update:
 git ctx edit <plan-id>
 ```
 
-## Implementations
+## Implementation
 
-| Version | Language | Status | Notes |
-|---------|----------|--------|-------|
-| `git-ctx` (root) | Bash | ✅ Complete | Full features, requires `jq` |
-| `go/` | Go | ✅ Core complete | Local storage works, sync pending |
+The `go/` directory contains the Go implementation with full local storage support and sync capabilities.
 
 ## Inspiration
 
