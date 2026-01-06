@@ -19,8 +19,11 @@ class GitCtx < Formula
     bin.install binary_name => "git-ctx"
   end
 
-  def post_install
-    system "git", "config", "--global", "alias.ctx", "!git-ctx"
+  def caveats
+    <<~EOS
+      To use as `git ctx`, add the alias:
+        git config --global alias.ctx '!git-ctx'
+    EOS
   end
 
   test do
