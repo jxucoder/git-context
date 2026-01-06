@@ -1,0 +1,1147 @@
+#!/bin/bash
+# ============================================================================
+# git-ctx: Simple context storage for vibe coding
+# ============================================================================
+#
+# Store coding context in git refs. Syncs with push/pull. Keeps repo clean.
+#
+# USAGE:
+#   git ctx add [--title "Title"]     Add context (opens editor)
+#   git ctx list                      List all context entries
+#   git ctx show <id>                 Show a context entry
+#   git ctx edit <id>                 Edit a context entry
+#   git ctx rm <id>                   Remove a context entry
+#   git ctx task add <title>          Create a task
+#   git ctx task list                 List tasks
+#   git ctx task done <id>            Mark task complete
+#   git ctx lock <target>             Lock task or file path
+#   git ctx lock list                 List all locks
+#   git ctx unlock [target]           Release lock(s)
+#   git ctx push                      Push context to remote
+#   git ctx pull                      Pull context from remote
+#
+# STORAGE:
+#   refs/context/memory/<id>    Memory entries (context, notes, plans)
+#   refs/context/tasks/<id>     Tasks
+#   refs/context/locks/<hash>   Locks (for tasks and files)
+#
+# ============================================================================
+
+set -euo pipefail
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Shared storage (syncs with push/pull)
+REFS_PREFIX="refs/context"
+
+# Local storage (private, never syncs) - DEFAULT
+LOCAL_DIR=".git/context"
+
+REMOTE="${GIT_CTX_REMOTE:-origin}"
+LOCK_EXPIRY_HOURS="${GIT_CTX_LOCK_EXPIRY:-4}"
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+# Generate a short random ID (8 hex chars)
+generate_id() {
+    # Use /dev/urandom for randomness, convert to hex
+    head -c 4 /dev/urandom | xxd -p
+}
+
+# Get current git user name (for author field)
+get_author() {
+    git config user.name 2>/dev/null || echo "${USER:-unknown}"
+}
+
+# Get current ISO timestamp
+get_timestamp() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# Hash a string to use as ref-safe name (for file paths)
+hash_path() {
+    echo -n "$1" | sha256sum | head -c 16
+}
+
+# Check if we're in a git repository
+ensure_git_repo() {
+    if ! git rev-parse --git-dir &>/dev/null; then
+        echo "Error: Not in a git repository" >&2
+        exit 1
+    fi
+}
+
+# Print error and exit
+die() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+# ============================================================================
+# STORAGE FUNCTIONS
+# ============================================================================
+# 
+# TWO STORAGE MODES:
+#
+# 1. LOCAL (default) - stored in .git/context/ as plain files
+#    - Private, never syncs
+#    - Simple file structure
+#
+# 2. SHARED (--shared flag) - stored in refs/context/ as git objects
+#    - Syncs with push/pull
+#    - Uses git blobs and trees
+#
+# Structure:
+#   .git/context/              (local)
+#   refs/context/              (shared)
+#     ├── memory/<id>/
+#     │     ├── meta.json
+#     │     └── content.md
+#     ├── tasks/<id>.json
+#     └── locks/<hash>.json
+#
+# ============================================================================
+
+# Get the git directory path
+get_git_dir() {
+    git rev-parse --git-dir
+}
+
+# Ensure local storage directory exists
+ensure_local_dir() {
+    local subdir="$1"
+    local git_dir=$(get_git_dir)
+    mkdir -p "$git_dir/context/$subdir"
+    echo "$git_dir/context/$subdir"
+}
+
+# ============================================================================
+# LOCAL STORAGE (default)
+# ============================================================================
+
+# Write a memory entry to local storage
+write_memory_local() {
+    local id="$1"
+    local title="$2"
+    local content="$3"
+    local author=$(get_author)
+    local now=$(get_timestamp)
+    
+    local dir=$(ensure_local_dir "memory/$id")
+    
+    # Write metadata
+    cat > "$dir/meta.json" <<EOF
+{
+  "id": "$id",
+  "title": "$title",
+  "author": "$author",
+  "createdAt": "$now",
+  "updatedAt": "$now",
+  "shared": false
+}
+EOF
+    
+    # Write content
+    echo "$content" > "$dir/content.md"
+}
+
+# Read a memory entry from local storage
+read_memory_local() {
+    local id="$1"
+    local git_dir=$(get_git_dir)
+    local dir="$git_dir/context/memory/$id"
+    
+    if [[ ! -d "$dir" ]]; then
+        return 1
+    fi
+    
+    local meta=$(cat "$dir/meta.json")
+    local content=$(cat "$dir/content.md")
+    
+    echo "$meta" | jq --arg content "$content" '. + {content: $content}'
+}
+
+# List all local memory IDs
+list_memory_local() {
+    local git_dir=$(get_git_dir)
+    local dir="$git_dir/context/memory"
+    
+    if [[ -d "$dir" ]]; then
+        ls -1 "$dir" 2>/dev/null || true
+    fi
+}
+
+# Delete a local memory entry
+delete_memory_local() {
+    local id="$1"
+    local git_dir=$(get_git_dir)
+    local dir="$git_dir/context/memory/$id"
+    
+    if [[ -d "$dir" ]]; then
+        rm -rf "$dir"
+        return 0
+    fi
+    return 1
+}
+
+# Write a task to local storage
+write_task_local() {
+    local id="$1"
+    local title="$2"
+    local author=$(get_author)
+    local now=$(get_timestamp)
+    
+    local dir=$(ensure_local_dir "tasks")
+    
+    cat > "$dir/$id.json" <<EOF
+{
+  "id": "$id",
+  "title": "$title",
+  "status": "open",
+  "createdBy": "$author",
+  "createdAt": "$now",
+  "shared": false
+}
+EOF
+}
+
+# Read a task from local storage
+read_task_local() {
+    local id="$1"
+    local git_dir=$(get_git_dir)
+    local file="$git_dir/context/tasks/$id.json"
+    
+    if [[ -f "$file" ]]; then
+        cat "$file"
+    else
+        return 1
+    fi
+}
+
+# Update a task in local storage
+update_task_local() {
+    local id="$1"
+    local update="$2"
+    local git_dir=$(get_git_dir)
+    local file="$git_dir/context/tasks/$id.json"
+    
+    if [[ ! -f "$file" ]]; then
+        return 1
+    fi
+    
+    local current=$(cat "$file")
+    local updated=$(echo "$current" | jq ". + $update")
+    echo "$updated" > "$file"
+}
+
+# List all local task IDs
+list_tasks_local() {
+    local git_dir=$(get_git_dir)
+    local dir="$git_dir/context/tasks"
+    
+    if [[ -d "$dir" ]]; then
+        ls -1 "$dir" 2>/dev/null | sed 's/\.json$//' || true
+    fi
+}
+
+# Write a lock to local storage
+write_lock_local() {
+    local target="$1"
+    local hash=$(hash_path "$target")
+    local author=$(get_author)
+    local now=$(get_timestamp)
+    local expiry=$(date -u -d "+$LOCK_EXPIRY_HOURS hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                   date -u -v+${LOCK_EXPIRY_HOURS}H +"%Y-%m-%dT%H:%M:%SZ")
+    
+    local dir=$(ensure_local_dir "locks")
+    
+    cat > "$dir/$hash.json" <<EOF
+{
+  "target": "$target",
+  "lockedBy": "$author",
+  "lockedAt": "$now",
+  "expiresAt": "$expiry"
+}
+EOF
+}
+
+# Read a lock from local storage
+read_lock_local() {
+    local target="$1"
+    local hash=$(hash_path "$target")
+    local git_dir=$(get_git_dir)
+    local file="$git_dir/context/locks/$hash.json"
+    
+    if [[ -f "$file" ]]; then
+        cat "$file"
+    else
+        return 1
+    fi
+}
+
+# Delete a lock from local storage
+delete_lock_local() {
+    local target="$1"
+    local hash=$(hash_path "$target")
+    local git_dir=$(get_git_dir)
+    local file="$git_dir/context/locks/$hash.json"
+    
+    if [[ -f "$file" ]]; then
+        rm "$file"
+        return 0
+    fi
+    return 1
+}
+
+# List all local lock files
+list_locks_local() {
+    local git_dir=$(get_git_dir)
+    local dir="$git_dir/context/locks"
+    
+    if [[ -d "$dir" ]]; then
+        ls -1 "$dir" 2>/dev/null | sed 's/\.json$//' || true
+    fi
+}
+
+# ============================================================================
+# SHARED STORAGE (git refs)
+# ============================================================================
+
+# Write a memory entry to git refs (shared)
+# Args: $1=id, $2=title, $3=content
+write_memory_shared() {
+    local id="$1"
+    local title="$2"
+    local content="$3"
+    local author=$(get_author)
+    local now=$(get_timestamp)
+    
+    # Create metadata JSON
+    local meta=$(cat <<EOF
+{
+  "id": "$id",
+  "title": "$title",
+  "author": "$author",
+  "createdAt": "$now",
+  "updatedAt": "$now"
+}
+EOF
+)
+    
+    # Store metadata and content as git blobs
+    local meta_blob=$(echo "$meta" | git hash-object -w --stdin)
+    local content_blob=$(echo "$content" | git hash-object -w --stdin)
+    
+    # Create a tree containing both blobs
+    # Format: <mode> <type> <hash>\t<filename>
+    local tree=$(printf "100644 blob %s\tmeta.json\n100644 blob %s\tcontent.md" \
+        "$meta_blob" "$content_blob" | git mktree)
+    
+    # Update the ref to point to this tree
+    git update-ref "$REFS_PREFIX/memory/$id" "$tree"
+}
+
+# Read a memory entry from git refs (shared)
+# Args: $1=id
+# Outputs: JSON with meta and content
+read_memory_shared() {
+    local id="$1"
+    local ref="$REFS_PREFIX/memory/$id"
+    
+    # Check if ref exists
+    if ! git rev-parse "$ref" &>/dev/null; then
+        return 1
+    fi
+    
+    # Get the tree hash
+    local tree=$(git rev-parse "$ref")
+    
+    # Extract blob hashes from tree
+    local meta_blob=$(git ls-tree "$tree" | grep "meta.json" | awk '{print $3}')
+    local content_blob=$(git ls-tree "$tree" | grep "content.md" | awk '{print $3}')
+    
+    # Read and output
+    local meta=$(git cat-file -p "$meta_blob")
+    local content=$(git cat-file -p "$content_blob")
+    
+    # Output as combined JSON (for parsing)
+    echo "$meta" | jq --arg content "$content" '. + {content: $content}'
+}
+
+# List all memory entry IDs (shared)
+list_memory_shared() {
+    git for-each-ref --format='%(refname)' "$REFS_PREFIX/memory/" 2>/dev/null | \
+        while read ref; do
+            basename "$ref"
+        done
+}
+
+# Delete a memory entry (shared)
+# Args: $1=id
+delete_memory_shared() {
+    local id="$1"
+    local ref="$REFS_PREFIX/memory/$id"
+    
+    if git rev-parse "$ref" &>/dev/null; then
+        git update-ref -d "$ref"
+        return 0
+    fi
+    return 1
+}
+
+# Write a task to git refs (shared)
+# Args: $1=id, $2=title
+write_task_shared() {
+    local id="$1"
+    local title="$2"
+    local author=$(get_author)
+    local now=$(get_timestamp)
+    
+    local task=$(cat <<EOF
+{
+  "id": "$id",
+  "title": "$title",
+  "status": "open",
+  "createdBy": "$author",
+  "createdAt": "$now"
+}
+EOF
+)
+    
+    local blob=$(echo "$task" | git hash-object -w --stdin)
+    git update-ref "$REFS_PREFIX/tasks/$id" "$blob"
+}
+
+# Read a task from git refs (shared)
+# Args: $1=id
+read_task_shared() {
+    local id="$1"
+    local ref="$REFS_PREFIX/tasks/$id"
+    
+    if ! git rev-parse "$ref" &>/dev/null; then
+        return 1
+    fi
+    
+    local blob=$(git rev-parse "$ref")
+    git cat-file -p "$blob"
+}
+
+# Update a task's JSON (shared)
+# Args: $1=id, $2=json_update (will be merged)
+update_task_shared() {
+    local id="$1"
+    local update="$2"
+    
+    local current=$(read_task "$id") || return 1
+    local updated=$(echo "$current" | jq ". + $update")
+    
+    local blob=$(echo "$updated" | git hash-object -w --stdin)
+    git update-ref "$REFS_PREFIX/tasks/$id" "$blob"
+}
+
+# List all task IDs (shared)
+list_tasks_shared() {
+    git for-each-ref --format='%(refname)' "$REFS_PREFIX/tasks/" 2>/dev/null | \
+        while read ref; do
+            basename "$ref"
+        done
+}
+
+# Write a lock (shared)
+# Args: $1=target (task id or file path)
+write_lock_shared() {
+    local target="$1"
+    local hash=$(hash_path "$target")
+    local author=$(get_author)
+    local now=$(get_timestamp)
+    local expiry=$(date -u -d "+$LOCK_EXPIRY_HOURS hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                   date -u -v+${LOCK_EXPIRY_HOURS}H +"%Y-%m-%dT%H:%M:%SZ")
+    
+    local lock=$(cat <<EOF
+{
+  "target": "$target",
+  "lockedBy": "$author",
+  "lockedAt": "$now",
+  "expiresAt": "$expiry"
+}
+EOF
+)
+    
+    local blob=$(echo "$lock" | git hash-object -w --stdin)
+    git update-ref "$REFS_PREFIX/locks/$hash" "$blob"
+}
+
+# Read a lock (shared)
+# Args: $1=target
+read_lock_shared() {
+    local target="$1"
+    local hash=$(hash_path "$target")
+    local ref="$REFS_PREFIX/locks/$hash"
+    
+    if ! git rev-parse "$ref" &>/dev/null; then
+        return 1
+    fi
+    
+    local blob=$(git rev-parse "$ref")
+    git cat-file -p "$blob"
+}
+
+# Delete a lock (shared)
+# Args: $1=target
+delete_lock_shared() {
+    local target="$1"
+    local hash=$(hash_path "$target")
+    local ref="$REFS_PREFIX/locks/$hash"
+    
+    if git rev-parse "$ref" &>/dev/null; then
+        git update-ref -d "$ref"
+        return 0
+    fi
+    return 1
+}
+
+# List all lock refs (shared)
+list_locks_shared_refs() {
+    git for-each-ref --format='%(refname)' "$REFS_PREFIX/locks/" 2>/dev/null
+}
+
+# Get lock data as JSON (shared)
+get_lock_data_shared() {
+    local ref="$1"
+    local blob=$(git rev-parse "$ref")
+    git cat-file -p "$blob"
+}
+
+# ============================================================================
+# MEMORY COMMANDS
+# ============================================================================
+
+# Add a new memory entry
+cmd_add() {
+    local title="Untitled"
+    local content=""
+    local use_editor=true
+    local shared=false  # Default: local (private)
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title|-t)
+                title="$2"
+                shift 2
+                ;;
+            --message|-m)
+                content="$2"
+                use_editor=false
+                shift 2
+                ;;
+            --shared|-s)
+                shared=true
+                shift
+                ;;
+            *)
+                # Treat remaining args as title if no flag
+                if [[ -z "$title" || "$title" == "Untitled" ]]; then
+                    title="$*"
+                fi
+                break
+                ;;
+        esac
+    done
+    
+    # Get content from stdin (if piped) or editor
+    if $use_editor && [[ -z "$content" ]]; then
+        if [[ ! -t 0 ]]; then
+            # Read from stdin (piped input)
+            content=$(cat)
+        else
+            # Open editor
+            local tmpfile=$(mktemp)
+            echo "# $title" > "$tmpfile"
+            echo "" >> "$tmpfile"
+            echo "# Write your content above. Lines starting with # are kept." >> "$tmpfile"
+            
+            ${EDITOR:-vim} "$tmpfile"
+            content=$(cat "$tmpfile")
+            rm "$tmpfile"
+        fi
+    fi
+    
+    # Generate ID and write
+    local id=$(generate_id)
+    
+    if $shared; then
+        write_memory_shared "$id" "$title" "$content"
+        echo "Created (shared): $id"
+    else
+        write_memory_local "$id" "$title" "$content"
+        echo "Created (local): $id"
+    fi
+}
+
+# List all memory entries
+cmd_list() {
+    local format="table"  # table or json
+    local show_shared=false
+    local show_all=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)
+                format="json"
+                shift
+                ;;
+            --shared|-s)
+                show_shared=true
+                shift
+                ;;
+            --all|-a)
+                show_all=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    
+    if [[ "$format" == "json" ]]; then
+        echo "["
+        local first=true
+        
+        # Local entries (default)
+        if ! $show_shared || $show_all; then
+            for id in $(list_memory_local); do
+                if $first; then first=false; else echo ","; fi
+                read_memory_local "$id"
+            done
+        fi
+        
+        # Shared entries
+        if $show_shared || $show_all; then
+            for id in $(list_memory_shared); do
+                if $first; then first=false; else echo ","; fi
+                read_memory_shared "$id"
+            done
+        fi
+        
+        echo "]"
+    else
+        # Table format
+        printf "%-10s %-45s %-10s %s\n" "ID" "TITLE" "TYPE" "AUTHOR"
+        printf "%-10s %-45s %-10s %s\n" "----" "-----" "----" "------"
+        
+        # Local entries (default)
+        if ! $show_shared || $show_all; then
+            for id in $(list_memory_local); do
+                local data=$(read_memory_local "$id")
+                local title=$(echo "$data" | jq -r '.title' | head -c 45)
+                local author=$(echo "$data" | jq -r '.author')
+                printf "%-10s %-45s %-10s %s\n" "$id" "$title" "[local]" "$author"
+            done
+        fi
+        
+        # Shared entries
+        if $show_shared || $show_all; then
+            for id in $(list_memory_shared); do
+                local data=$(read_memory_shared "$id")
+                local title=$(echo "$data" | jq -r '.title' | head -c 45)
+                local author=$(echo "$data" | jq -r '.author')
+                printf "%-10s %-45s %-10s %s\n" "$id" "$title" "[shared]" "$author"
+            done
+        fi
+    fi
+}
+
+# Show a memory entry (checks both local and shared)
+cmd_show() {
+    local id="$1"
+    
+    if [[ -z "$id" ]]; then
+        die "Usage: git ctx show <id>"
+    fi
+    
+    # Try local first, then shared
+    local data=""
+    local storage_type=""
+    
+    data=$(read_memory_local "$id" 2>/dev/null)
+    if [[ -n "$data" ]]; then
+        storage_type="local"
+    else
+        data=$(read_memory_shared "$id" 2>/dev/null)
+        if [[ -n "$data" ]]; then
+            storage_type="shared"
+        fi
+    fi
+    
+    if [[ -z "$data" ]]; then
+        die "Not found: $id"
+    fi
+    
+    local title=$(echo "$data" | jq -r '.title')
+    local author=$(echo "$data" | jq -r '.author')
+    local created=$(echo "$data" | jq -r '.createdAt')
+    local content=$(echo "$data" | jq -r '.content')
+    
+    echo "════════════════════════════════════════════════════════════"
+    echo "  $title"
+    echo "  by $author • $created • [$storage_type]"
+    echo "════════════════════════════════════════════════════════════"
+    echo ""
+    echo "$content"
+}
+
+# Edit a memory entry (checks both local and shared)
+cmd_edit() {
+    local id="$1"
+    
+    if [[ -z "$id" ]]; then
+        die "Usage: git ctx edit <id>"
+    fi
+    
+    # Try local first, then shared
+    local data=""
+    local is_local=false
+    
+    data=$(read_memory_local "$id" 2>/dev/null)
+    if [[ -n "$data" ]]; then
+        is_local=true
+    else
+        data=$(read_memory_shared "$id" 2>/dev/null)
+    fi
+    
+    if [[ -z "$data" ]]; then
+        die "Not found: $id"
+    fi
+    
+    local title=$(echo "$data" | jq -r '.title')
+    local content=$(echo "$data" | jq -r '.content')
+    
+    # Open in editor
+    local tmpfile=$(mktemp)
+    echo "$content" > "$tmpfile"
+    ${EDITOR:-vim} "$tmpfile"
+    local new_content=$(cat "$tmpfile")
+    rm "$tmpfile"
+    
+    # Update in same storage
+    if $is_local; then
+        write_memory_local "$id" "$title" "$new_content"
+    else
+        write_memory_shared "$id" "$title" "$new_content"
+    fi
+    echo "Updated: $id"
+}
+
+# Remove a memory entry (checks both local and shared)
+cmd_rm() {
+    local id="$1"
+    
+    if [[ -z "$id" ]]; then
+        die "Usage: git ctx rm <id>"
+    fi
+    
+    # Try local first, then shared
+    if delete_memory_local "$id" 2>/dev/null; then
+        echo "Removed (local): $id"
+    elif delete_memory_shared "$id" 2>/dev/null; then
+        echo "Removed (shared): $id"
+    else
+        die "Not found: $id"
+    fi
+}
+
+# ============================================================================
+# TASK COMMANDS
+# ============================================================================
+
+# Add a new task
+cmd_task_add() {
+    local title=""
+    local shared=false
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --shared|-s)
+                shared=true
+                shift
+                ;;
+            *)
+                if [[ -z "$title" ]]; then
+                    title="$1"
+                else
+                    title="$title $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    if [[ -z "$title" ]]; then
+        die "Usage: git ctx task add [--shared] <title>"
+    fi
+    
+    local id="task-$(generate_id)"
+    
+    if $shared; then
+        write_task_shared "$id" "$title"
+        echo "Created (shared): $id"
+    else
+        write_task_local "$id" "$title"
+        echo "Created (local): $id"
+    fi
+}
+
+# List all tasks
+cmd_task_list() {
+    local show_shared=false
+    local show_all=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --shared|-s) show_shared=true; shift ;;
+            --all|-a) show_all=true; shift ;;
+            *) shift ;;
+        esac
+    done
+    
+    printf "%-14s %-35s %-10s %-10s %s\n" "ID" "TITLE" "STATUS" "TYPE" "CREATED BY"
+    printf "%-14s %-35s %-10s %-10s %s\n" "----" "-----" "------" "----" "----------"
+    
+    # Helper to print task
+    print_task() {
+        local id="$1"
+        local data="$2"
+        local type="$3"
+        
+        local title=$(echo "$data" | jq -r '.title' | head -c 35)
+        local status=$(echo "$data" | jq -r '.status')
+        local creator=$(echo "$data" | jq -r '.createdBy')
+        
+        # Check if locked (local or shared)
+        local lock_data=""
+        lock_data=$(read_lock_local "$id" 2>/dev/null) || lock_data=$(read_lock_shared "$id" 2>/dev/null) || true
+        if [[ -n "$lock_data" ]]; then
+            local locker=$(echo "$lock_data" | jq -r '.lockedBy')
+            status="locked"
+        fi
+        
+        printf "%-14s %-35s %-10s %-10s %s\n" "$id" "$title" "[$status]" "[$type]" "$creator"
+    }
+    
+    # Local tasks (default)
+    if ! $show_shared || $show_all; then
+        for id in $(list_tasks_local); do
+            local data=$(read_task_local "$id")
+            print_task "$id" "$data" "local"
+        done
+    fi
+    
+    # Shared tasks
+    if $show_shared || $show_all; then
+        for id in $(list_tasks_shared); do
+            local data=$(read_task_shared "$id")
+            print_task "$id" "$data" "shared"
+        done
+    fi
+}
+
+# Show a task (checks both local and shared)
+cmd_task_show() {
+    local id="$1"
+    
+    if [[ -z "$id" ]]; then
+        die "Usage: git ctx task show <id>"
+    fi
+    
+    # Try local first, then shared
+    local data=""
+    data=$(read_task_local "$id" 2>/dev/null) || data=$(read_task_shared "$id" 2>/dev/null) || die "Not found: $id"
+    echo "$data" | jq .
+}
+
+# Mark a task as done (checks both local and shared)
+cmd_task_done() {
+    local id="$1"
+    
+    if [[ -z "$id" ]]; then
+        die "Usage: git ctx task done <id>"
+    fi
+    
+    local now=$(get_timestamp)
+    local is_local=false
+    
+    # Try local first, then shared
+    if read_task_local "$id" &>/dev/null; then
+        is_local=true
+        update_task_local "$id" "{\"status\": \"done\", \"doneAt\": \"$now\"}" || die "Not found: $id"
+    elif read_task_shared "$id" &>/dev/null; then
+        update_task_shared "$id" "{\"status\": \"done\", \"doneAt\": \"$now\"}" || die "Not found: $id"
+    else
+        die "Not found: $id"
+    fi
+    
+    # Release any lock on this task (both local and shared)
+    delete_lock_local "$id" 2>/dev/null || true
+    delete_lock_shared "$id" 2>/dev/null || true
+    
+    echo "Done: $id"
+}
+
+# ============================================================================
+# LOCK COMMANDS
+# ============================================================================
+
+# Lock a target (task or file path) - local by default
+cmd_lock() {
+    local target=""
+    local shared=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --shared|-s) shared=true; shift ;;
+            *) target="$1"; shift ;;
+        esac
+    done
+    
+    if [[ -z "$target" ]]; then
+        die "Usage: git ctx lock [--shared] <target>"
+    fi
+    
+    # Check if already locked (both local and shared)
+    local lock_data=""
+    lock_data=$(read_lock_local "$target" 2>/dev/null) || lock_data=$(read_lock_shared "$target" 2>/dev/null) || true
+    if [[ -n "$lock_data" ]]; then
+        local locker=$(echo "$lock_data" | jq -r '.lockedBy')
+        local expires=$(echo "$lock_data" | jq -r '.expiresAt')
+        die "Already locked by $locker (expires: $expires)"
+    fi
+    
+    if $shared; then
+        write_lock_shared "$target"
+        echo "Locked (shared): $target"
+    else
+        write_lock_local "$target"
+        echo "Locked (local): $target"
+    fi
+}
+
+# List all locks (both local and shared)
+cmd_lock_list() {
+    local show_shared=false
+    local show_all=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --shared|-s) show_shared=true; shift ;;
+            --all|-a) show_all=true; shift ;;
+            *) shift ;;
+        esac
+    done
+    
+    printf "%-30s %-15s %-10s %s\n" "TARGET" "LOCKED BY" "TYPE" "EXPIRES"
+    printf "%-30s %-15s %-10s %s\n" "------" "---------" "----" "-------"
+    
+    # Local locks (default)
+    if ! $show_shared || $show_all; then
+        local git_dir=$(get_git_dir)
+        local dir="$git_dir/context/locks"
+        if [[ -d "$dir" ]]; then
+            for file in "$dir"/*.json; do
+                [[ -f "$file" ]] || continue
+                local lock_json=$(cat "$file")
+                local target=$(echo "$lock_json" | jq -r '.target')
+                local locker=$(echo "$lock_json" | jq -r '.lockedBy')
+                local expires=$(echo "$lock_json" | jq -r '.expiresAt')
+                printf "%-30s %-15s %-10s %s\n" "$target" "$locker" "[local]" "$expires"
+            done
+        fi
+    fi
+    
+    # Shared locks
+    if $show_shared || $show_all; then
+        for ref in $(list_locks_shared_refs); do
+            local lock_json=$(get_lock_data_shared "$ref")
+            local target=$(echo "$lock_json" | jq -r '.target')
+            local locker=$(echo "$lock_json" | jq -r '.lockedBy')
+            local expires=$(echo "$lock_json" | jq -r '.expiresAt')
+            printf "%-30s %-15s %-10s %s\n" "$target" "$locker" "[shared]" "$expires"
+        done
+    fi
+}
+
+# Unlock a target (or all your locks)
+cmd_unlock() {
+    local target="${1:-}"
+    local author=$(get_author)
+    
+    if [[ -z "$target" ]]; then
+        # Unlock all locks owned by current user (both local and shared)
+        local git_dir=$(get_git_dir)
+        local dir="$git_dir/context/locks"
+        if [[ -d "$dir" ]]; then
+            for file in "$dir"/*.json; do
+                [[ -f "$file" ]] || continue
+                local lock_json=$(cat "$file")
+                local lock_target=$(echo "$lock_json" | jq -r '.target')
+                local locker=$(echo "$lock_json" | jq -r '.lockedBy')
+                if [[ "$locker" == "$author" ]]; then
+                    delete_lock_local "$lock_target"
+                    echo "Unlocked (local): $lock_target"
+                fi
+            done
+        fi
+        
+        for ref in $(list_locks_shared_refs); do
+            local lock_json=$(get_lock_data_shared "$ref")
+            local lock_target=$(echo "$lock_json" | jq -r '.target')
+            local locker=$(echo "$lock_json" | jq -r '.lockedBy')
+            if [[ "$locker" == "$author" ]]; then
+                delete_lock_shared "$lock_target"
+                echo "Unlocked (shared): $lock_target"
+            fi
+        done
+    else
+        # Unlock specific target (check both local and shared)
+        local lock_data=""
+        local is_local=false
+        
+        lock_data=$(read_lock_local "$target" 2>/dev/null) && is_local=true
+        if [[ -z "$lock_data" ]]; then
+            lock_data=$(read_lock_shared "$target" 2>/dev/null)
+        fi
+        
+        if [[ -z "$lock_data" ]]; then
+            die "Not locked: $target"
+        fi
+        
+        local locker=$(echo "$lock_data" | jq -r '.lockedBy')
+        if [[ "$locker" != "$author" ]]; then
+            die "Cannot unlock: owned by $locker"
+        fi
+        
+        if $is_local; then
+            delete_lock_local "$target"
+            echo "Unlocked (local): $target"
+        else
+            delete_lock_shared "$target"
+            echo "Unlocked (shared): $target"
+        fi
+    fi
+}
+
+# ============================================================================
+# SYNC COMMANDS
+# ============================================================================
+
+# Push context refs to remote
+cmd_push() {
+    local remote="${1:-$REMOTE}"
+    
+    echo "Pushing context to $remote..."
+    git push "$remote" "$REFS_PREFIX/*:$REFS_PREFIX/*" 2>&1 || true
+    echo "Done."
+}
+
+# Pull context refs from remote
+cmd_pull() {
+    local remote="${1:-$REMOTE}"
+    
+    echo "Pulling context from $remote..."
+    git fetch "$remote" "$REFS_PREFIX/*:$REFS_PREFIX/*" 2>&1 || true
+    echo "Done."
+}
+
+# ============================================================================
+# MAIN COMMAND ROUTER
+# ============================================================================
+
+main() {
+    ensure_git_repo
+    
+    local cmd="${1:-help}"
+    shift || true
+    
+    case "$cmd" in
+        # Memory commands
+        add)
+            cmd_add "$@"
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        show)
+            cmd_show "$@"
+            ;;
+        edit)
+            cmd_edit "$@"
+            ;;
+        rm|remove)
+            cmd_rm "$@"
+            ;;
+        
+        # Task commands
+        task)
+            local subcmd="${1:-list}"
+            shift || true
+            case "$subcmd" in
+                add)
+                    cmd_task_add "$@"
+                    ;;
+                list|ls)
+                    cmd_task_list "$@"
+                    ;;
+                show)
+                    cmd_task_show "$@"
+                    ;;
+                done)
+                    cmd_task_done "$@"
+                    ;;
+                *)
+                    die "Unknown task command: $subcmd"
+                    ;;
+            esac
+            ;;
+        
+        # Lock commands
+        lock)
+            local subcmd="${1:-}"
+            if [[ "$subcmd" == "list" ]]; then
+                shift
+                cmd_lock_list "$@"
+            else
+                cmd_lock "$@"
+            fi
+            ;;
+        unlock)
+            cmd_unlock "$@"
+            ;;
+        
+        # Sync commands
+        push)
+            cmd_push "$@"
+            ;;
+        pull)
+            cmd_pull "$@"
+            ;;
+        
+        # Help
+        help|--help|-h)
+            sed -n '2,28p' "$0" | sed 's/^# //' | sed 's/^#//'
+            ;;
+        
+        *)
+            die "Unknown command: $cmd. Try 'git ctx help'"
+            ;;
+    esac
+}
+
+# Run main with all arguments
+main "$@"
+
