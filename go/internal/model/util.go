@@ -46,3 +46,4 @@ func getGitConfig(key string) string {
 	return strings.TrimSpace(string(output))
 }
 
+

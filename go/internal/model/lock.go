@@ -34,3 +34,4 @@ func (l *Lock) IsOwnedBy(user string) bool {
 	return l.LockedBy == user
 }
 
+

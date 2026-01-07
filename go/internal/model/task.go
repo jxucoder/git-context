@@ -104,3 +104,4 @@ func (t *Task) MatchesSearch(query string) bool {
 		strings.Contains(strings.ToLower(t.Description), query)
 }
 
+

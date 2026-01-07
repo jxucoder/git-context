@@ -92,3 +92,4 @@ func outputTable(memories []*model.Memory) error {
 	return w.Flush()
 }
 
+

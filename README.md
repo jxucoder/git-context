@@ -15,13 +15,39 @@ Store coding context, decisions, and tasks directly in your git repository. Work
 
 ## Installation
 
+### Homebrew (macOS)
+
+```bash
+brew tap jxucoder/tap
+brew install git-ctx
+git config --global alias.ctx '!git-ctx'
+```
+
+### Download Binary
+
+Download the appropriate binary from [Releases](https://github.com/jxucoder/git-context/releases):
+
+| Platform | Binary |
+|----------|--------|
+| macOS (Apple Silicon) | `git-ctx-darwin-arm64` |
+| macOS (Intel) | `git-ctx-darwin-amd64` |
+| Linux (x64) | `git-ctx-linux-amd64` |
+| Linux (ARM64) | `git-ctx-linux-arm64` |
+| Windows (x64) | `git-ctx-windows-amd64.exe` |
+
+```bash
+# Example: macOS Apple Silicon
+curl -L -o git-ctx https://github.com/jxucoder/git-context/releases/download/v0.2.0/git-ctx-darwin-arm64
+chmod +x git-ctx
+mv git-ctx ~/.local/bin/
+git config --global alias.ctx '!git-ctx'
+```
+
+### Build from Source
+
 ```bash
 cd go
 make install
-# Or manually:
-CGO_ENABLED=0 go build -o git-ctx ./cmd/git-ctx
-cp git-ctx ~/.local/bin/
-git config --global alias.ctx '!git-ctx'
 ```
 
 ## Quick Start
