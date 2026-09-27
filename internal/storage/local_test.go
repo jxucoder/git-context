@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -368,7 +369,7 @@ func TestLocalStorage_Lock_ReplacesExpiredAndCorrupt(t *testing.T) {
 
 func TestLocalStorage_Lock_ConcurrentAcquire(t *testing.T) {
 	s := newTestStorage(t)
-	const agents = 16
+	const agents = 32
 
 	stale := model.NewLock("shared/target", "zombie")
 	stale.ExpiresAt = time.Now().UTC().Add(-time.Hour)
@@ -382,7 +383,7 @@ func TestLocalStorage_Lock_ConcurrentAcquire(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results <- s.WriteLock(model.NewLock("shared/target", string(rune('a'+i))))
+			results <- s.WriteLock(model.NewLock("shared/target", fmt.Sprintf("agent%02d", i)))
 		}(i)
 	}
 	wg.Wait()

@@ -1,16 +1,16 @@
 class GitCtx < Formula
   desc "Distributed, offline-first context storage embedded in git"
   homepage "https://github.com/jxucoder/git-context"
-  version "0.3.0"
+  version "0.3.1"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/jxucoder/git-context/releases/download/v0.3.0/git-ctx-darwin-arm64"
-      sha256 "5495666ce58740f0fee333ab135960a9858fd1b2aaeeaadbd7bf77bbe4c35b1b"
+      url "https://github.com/jxucoder/git-context/releases/download/v0.3.1/git-ctx-darwin-arm64"
+      sha256 "f1386d38d983b7c4c131fb59e1c9c36e8068d7840ebecba64cd9100954533849"
     else
-      url "https://github.com/jxucoder/git-context/releases/download/v0.3.0/git-ctx-darwin-amd64"
-      sha256 "9ad6c00ebb17c31b6c12311ff85f954daaafa5eeb9e0a75ea19303f9514c7ef8"
+      url "https://github.com/jxucoder/git-context/releases/download/v0.3.1/git-ctx-darwin-amd64"
+      sha256 "aa2a9e1545b88d57f925e47bece855f9d44363c0980e5a9e9a07c06c4fa9b3cd"
     end
   end
 

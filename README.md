@@ -36,7 +36,7 @@ Download the appropriate binary from [Releases](https://github.com/jxucoder/git-
 
 ```bash
 # Example: macOS Apple Silicon
-curl -L -o git-ctx https://github.com/jxucoder/git-context/releases/download/v0.3.0/git-ctx-darwin-arm64
+curl -L -o git-ctx https://github.com/jxucoder/git-context/releases/download/v0.3.1/git-ctx-darwin-arm64
 chmod +x git-ctx
 mv git-ctx ~/.local/bin/
 git config --global alias.ctx '!git-ctx'

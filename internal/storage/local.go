@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/jxucoder/git-context/internal/model"
 )
@@ -274,6 +275,11 @@ func (s *LocalStorage) lockPath(target string) string {
 	return filepath.Join(s.baseDir, "locks", hashTarget(target)+".json")
 }
 
+// takeoverGuardTimeout is how long a takeover guard left behind by a crashed
+// agent is respected before another agent clears it. Guards are held for the
+// few file operations of a stale-lock takeover, so this is generous.
+const takeoverGuardTimeout = 30 * time.Second
+
 // WriteLock acquires the lock atomically, so two concurrent callers cannot
 // both succeed. An unexpired lock held by someone else yields *LockedError.
 // An expired, corrupt, or self-owned lock file is replaced.
@@ -288,7 +294,7 @@ func (s *LocalStorage) WriteLock(l *model.Lock) error {
 		return err
 	}
 
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < 100; attempt++ {
 		err := createExclusive(path, data)
 		if err == nil {
 			return nil
@@ -301,11 +307,21 @@ func (s *LocalStorage) WriteLock(l *model.Lock) error {
 		switch {
 		case err == nil && !existing.IsExpired() && !existing.IsOwnedBy(l.LockedBy):
 			return &LockedError{Lock: existing}
-		case err != nil && !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrCorrupt):
+		case errors.Is(err, ErrNotFound):
+			// Removed between our create and read; try to create again.
+			continue
+		case err != nil && !errors.Is(err, ErrCorrupt):
 			return err
 		}
-		if err := removeStaleLock(path, l.LockedBy); err != nil {
+
+		// The file is expired, corrupt, or ours: remove it and create again.
+		removed, err := s.removeStaleLock(path, l.LockedBy)
+		if err != nil {
 			return err
+		}
+		if !removed {
+			// Another agent is in the middle of a takeover; let it finish.
+			time.Sleep(time.Duration(1+attempt%5) * time.Millisecond)
 		}
 	}
 
@@ -352,32 +368,43 @@ func createExclusive(path string, data []byte) error {
 	return f.Close()
 }
 
-// removeStaleLock removes the lock file at path after it was read as expired,
-// corrupt or owned by owner. The file is renamed aside and re-checked first,
-// so a fresh lock another agent created in the meantime is put back instead
-// of being deleted.
-func removeStaleLock(path, owner string) error {
-	aside := path + ".stale-" + model.GenerateID()
-	if err := os.Rename(path, aside); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	defer os.Remove(aside)
-
-	data, err := os.ReadFile(aside)
+// removeStaleLock removes the lock file at path if it is still expired,
+// corrupt or owned by owner. Takeovers are serialized through a guard file:
+// while the guard is held nobody else can remove the file, and nobody can
+// create a fresh lock while the stale file exists, so the re-check under the
+// guard cannot be invalidated before the removal. It reports false when
+// another agent holds the guard.
+func (s *LocalStorage) removeStaleLock(path, owner string) (bool, error) {
+	guard := path + ".takeover"
+	f, err := os.OpenFile(guard, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
-		return nil
+		if !errors.Is(err, fs.ErrExist) {
+			return false, err
+		}
+		if info, serr := os.Stat(guard); serr == nil && time.Since(info.ModTime()) > takeoverGuardTimeout {
+			os.Remove(guard)
+		}
+		return false, nil
+	}
+	f.Close()
+	defer os.Remove(guard)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return true, nil
+		}
+		return false, err
 	}
 	var l model.Lock
-	if json.Unmarshal(data, &l) != nil || l.IsExpired() || l.IsOwnedBy(owner) {
-		return nil
+	if json.Unmarshal(data, &l) == nil && !l.IsExpired() && !l.IsOwnedBy(owner) {
+		// A fresh lock arrived first; the caller's next create reports it.
+		return true, nil
 	}
-	if err := os.Link(aside, path); err != nil && !errors.Is(err, fs.ErrExist) {
-		return err
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, err
 	}
-	return &LockedError{Lock: &l}
+	return true, nil
 }
 
 func (s *LocalStorage) ReadLock(target string) (*model.Lock, error) {

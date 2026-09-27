@@ -1,6 +1,6 @@
 # git-context Makefile
 BINARY=git-ctx
-VERSION=0.3.0
+VERSION=0.3.1
 MODULE=github.com/jxucoder/git-context
 LDFLAGS=-ldflags="-s -w -X $(MODULE)/internal/cmd.version=$(VERSION)"
 
