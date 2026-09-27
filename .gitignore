@@ -1,5 +1,5 @@
 .cursor
 repos
 docs
-
-
+/git-ctx
+/dist/
